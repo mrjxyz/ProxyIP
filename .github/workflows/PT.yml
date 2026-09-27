@@ -41,7 +41,8 @@ jobs:
 
           PROTON_REGIONS = ["US", "CA", "NL", "JP", "SG", "NO", "CH"]
 
-          MAX_PER_REGION = 5      # ★ 每地区最多提取 / 推送多少个
+          MAX_PER_REGION = 5       # 每地区最多提取 / 推送多少个
+          MAX_LOAD       = 90      # ★ 负载超过此值视为拥堵，不作为优质节点
           CF_PREFIX      = "pt-"
 
           CF_DOMAIN    = os.environ.get("CF_DOMAIN", "").strip().strip(".")
@@ -75,6 +76,10 @@ jobs:
                       return False
                   if (s.get("ServicesDown") or 0) > 0:
                       return False
+              # ★ 负载过高视为拥堵，不作为优质节点
+              load = node.get("Load")
+              if load is None or load > MAX_LOAD:
+                  return False
               return True
 
           def build_region_nodes(logicals):
@@ -98,10 +103,11 @@ jobs:
                       "tier": node.get("Tier"),
                       "features": node.get("Features"),
                   })
+              # ★ 排序：Score 升序（主）→ Load 升序（次）→ domain 升序（三）
               for r in buckets:
                   buckets[r].sort(key=lambda x: (
-                      x["load"] if x["load"] is not None else 9999,
                       x["score"] if x["score"] is not None else 9999,
+                      x["load"] if x["load"] is not None else 9999,
                       x["domain"] or "",
                   ))
                   buckets[r] = buckets[r][:MAX_PER_REGION]
@@ -111,7 +117,7 @@ jobs:
           def cf_delete_by_name(domain):
               headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
               url = (f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}"
-                     f"/dns_records?name={domain}&type=A")
+                     f"/dns_records?name={domain}")
               try:
                   req = urllib.request.Request(url, headers=headers)
                   with urllib.request.urlopen(req, timeout=15) as response:
@@ -134,15 +140,16 @@ jobs:
                       print(f"    [警告] 删除 {domain} (id={rec['id']}) 失败: {e}")
               return deleted
 
-          def cf_create(domain, ip):
+          def cf_create_cname(domain, target):
+              """创建 CNAME 记录，target 是 Proton 域名"""
               headers = {
                   "Authorization": f"Bearer {CF_API_TOKEN}",
                   "Content-Type": "application/json"
               }
               payload = {
-                  "type": "A",
+                  "type": "CNAME",
                   "name": domain,
-                  "content": ip,
+                  "content": target,
                   "ttl": 60,
                   "proxied": False
               }
@@ -175,7 +182,7 @@ jobs:
           def push_region(region, nodes):
               rl = region.lower()
               deleted = 0
-              # 清理该地区 1..MAX_PER_REGION 的确定名字
+              # 清理该地区 1..MAX_PER_REGION 的确定名字（CNAME 和 A 都删，避免残留）
               for idx in range(1, MAX_PER_REGION + 1):
                   d = f"{CF_PREFIX}{rl}{idx}.{CF_DOMAIN}"
                   deleted += cf_delete_by_name(d)
@@ -184,7 +191,8 @@ jobs:
               pushed = 0
               for idx, node in enumerate(nodes, start=1):
                   d = f"{CF_PREFIX}{rl}{idx}.{CF_DOMAIN}"
-                  if cf_create(d, node["ip"]):
+                  # ★ 推 CNAME，target 是 Proton 域名
+                  if cf_create_cname(d, node["domain"]):
                       pushed += 1
               return pushed
 
