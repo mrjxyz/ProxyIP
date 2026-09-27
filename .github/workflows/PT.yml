@@ -39,42 +39,34 @@ jobs:
           SRC_URL   = "https://raw.githubusercontent.com/tn3w/ProtonVPN-IPs/refs/heads/master/protonvpn_logicals.json"
           OUT_JSON  = "pt-logicals.json"
 
-          # 只处理这些地区（以后在这里扩展即可）
           PROTON_REGIONS = ["US", "CA", "NL", "JP", "SG", "NO", "CH"]
 
-          MAX_PER_REGION = 10     # 每地区最多提取 / 推送多少个
-          CF_PREFIX      = "pt-"  # 子域名固定前缀
+          MAX_PER_REGION = 10
+          CF_PREFIX      = "pt-"
 
-          # 节流参数（避免 CF 突发限流）
-          SLEEP_BETWEEN_API = 0.3   # 每次 CF API 调用间隔
-          SLEEP_AFTER_DELETE = 0.5  # 删除后等待，避免"记录删除中"冲突
+          CF_DOMAIN    = os.environ.get("CF_DOMAIN", "").strip().strip(".")
+          CF_ZONE_ID   = os.environ.get("CF_ZONE_ID", "").strip()
+          CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 
-          CF_DOMAIN   = os.environ.get("CF_DOMAIN", "").strip().strip(".")
-          CF_ZONE_ID  = os.environ.get("CF_ZONE_ID", "").strip()
-          CF_API_TOKEN= os.environ.get("CF_API_TOKEN", "").strip()
-
-          # ============ 工具函数 ============
+          # ============ 拉取 & 过滤 ============
           def fetch_json(url, timeout=30):
               req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
               with urllib.request.urlopen(req, timeout=timeout) as r:
                   return json.loads(r.read().decode("utf-8"))
 
-          def pick_ip(server):
-              """取该逻辑节点下第一个在线物理机的 ExitIP"""
-              for s in server.get("Servers", []) or []:
+          def pick_ip(node):
+              for s in node.get("Servers", []) or []:
                   if s.get("Status") == 1 and s.get("ExitIP"):
                       return s.get("ExitIP")
               return None
 
           def is_quality_node(node):
-              """优质免费节点过滤"""
               if node.get("Tier") != 0:
                   return False
               if "FREE" not in (node.get("Name") or "").upper():
                   return False
               if node.get("Status") != 1:
                   return False
-
               servers = node.get("Servers") or []
               if not servers:
                   return False
@@ -86,20 +78,16 @@ jobs:
               return True
 
           def build_region_nodes(logicals):
-              """按地区白名单构建 {REGION: [node_info, ...]}"""
               buckets = {r: [] for r in PROTON_REGIONS}
-
               for node in logicals:
                   country = (node.get("ExitCountry") or "").upper()
                   if country not in buckets:
                       continue
                   if not is_quality_node(node):
                       continue
-
                   ip = pick_ip(node)
                   if not ip:
                       continue
-
                   buckets[country].append({
                       "domain": node.get("Domain"),
                       "ip": ip,
@@ -110,8 +98,6 @@ jobs:
                       "tier": node.get("Tier"),
                       "features": node.get("Features"),
                   })
-
-              # 排序：Load 升序 -> Score 升序 -> domain 升序
               for r in buckets:
                   buckets[r].sort(key=lambda x: (
                       x["load"] if x["load"] is not None else 9999,
@@ -119,99 +105,100 @@ jobs:
                       x["domain"] or "",
                   ))
                   buckets[r] = buckets[r][:MAX_PER_REGION]
-
-              # 去掉空地区
               return {r: v for r, v in buckets.items() if v}
 
-          # ============ Cloudflare ============
-          def cf_request(url, method="GET", payload=None):
+          # ============ Cloudflare（照抄旧脚本模式） ============
+          def cf_delete_by_name(domain):
+              """查询并删除该域名的所有 A 记录（只删这一个域名）"""
               headers = {
                   "Authorization": f"Bearer {CF_API_TOKEN}",
-                  "Content-Type": "application/json",
               }
-              data = json.dumps(payload).encode("utf-8") if payload is not None else None
-              req = urllib.request.Request(url, data=data, headers=headers, method=method)
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  body = r.read().decode("utf-8")
-                  return json.loads(body) if body else {}
-
-          def cf_get_records_by_name(name):
-              """精确查询某个 A 记录（只查这一个名字，不拉全 zone）"""
               url = (f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}"
-                     f"/dns_records?type=A&name={name}&per_page=100")
+                     f"/dns_records?name={domain}&type=A")
               try:
-                  resp = cf_request(url, "GET")
-                  if not resp.get("success"):
-                      return []
-                  return resp.get("result", []) or []
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=15) as response:
+                      res_data = json.loads(response.read().decode('utf-8'))
+                      existing = res_data.get("result", []) or []
               except Exception as e:
-                  print(f"    [警告] 查询 {name} 失败: {e}")
-                  return []
+                  print(f"    [警告] 查询 {domain} 失败: {e}")
+                  return 0
 
-          def cf_delete_record(rec_id, name):
-              """删除单条记录"""
-              url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{rec_id}"
-              try:
-                  cf_request(url, "DELETE")
-                  return True
-              except Exception as e:
-                  print(f"    [警告] 删除 {name} (id={rec_id}) 失败: {e}")
-                  return False
+              deleted = 0
+              for rec in existing:
+                  del_url = (f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}"
+                             f"/dns_records/{rec['id']}")
+                  try:
+                      del_req = urllib.request.Request(del_url, headers=headers, method="DELETE")
+                      with urllib.request.urlopen(del_req, timeout=15):
+                          pass
+                      deleted += 1
+                  except Exception as e:
+                      print(f"    [警告] 删除 {domain} (id={rec['id']}) 失败: {e}")
+              return deleted
 
-          def cf_create_record(name, ip):
+          def cf_create(domain, ip):
               """创建单条 A 记录"""
-              url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
+              headers = {
+                  "Authorization": f"Bearer {CF_API_TOKEN}",
+                  "Content-Type": "application/json"
+              }
               payload = {
                   "type": "A",
-                  "name": name,
+                  "name": domain,
                   "content": ip,
                   "ttl": 60,
-                  "proxied": False,
+                  "proxied": False
               }
+              create_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
               try:
-                  resp = cf_request(url, "POST", payload)
-                  if resp.get("success"):
-                      return True
-                  print(f"    [警告] 创建 {name} 失败: {resp.get('errors')}")
+                  cr_req = urllib.request.Request(
+                      create_url,
+                      data=json.dumps(payload).encode('utf-8'),
+                      headers=headers,
+                      method="POST"
+                  )
+                  with urllib.request.urlopen(cr_req, timeout=15) as resp:
+                      body = resp.read().decode('utf-8')
+                      data = json.loads(body) if body else {}
+                      if data.get("success"):
+                          return True
+                      print(f"    [警告] 创建 {domain} 失败: {data.get('errors')}")
+                      return False
+              except urllib.error.HTTPError as e:
+                  # 把 CF 返回的 body 打出来，方便定位 400 原因
+                  try:
+                      err_body = e.read().decode('utf-8')
+                  except Exception:
+                      err_body = ""
+                  print(f"    [警告] 创建 {domain} HTTP {e.code}: {err_body}")
                   return False
               except Exception as e:
-                  print(f"    [警告] 创建 {name} 异常: {e}")
+                  print(f"    [警告] 创建 {domain} 异常: {e}")
                   return False
 
-          def cf_clear_region(region_lower):
-              """
-              删除 pt-{region}1 ~ pt-{region}10 这 10 个确定名字下的所有 A 记录。
-              不做前缀匹配、不拉全 zone、绝不触碰主域名和其他子域名。
-              """
-              removed = 0
-              for idx in range(1, MAX_PER_REGION + 1):
-                  name = f"{CF_PREFIX}{region_lower}{idx}.{CF_DOMAIN}"
-                  records = cf_get_records_by_name(name)
-                  time.sleep(SLEEP_BETWEEN_API)
-                  for rec in records:
-                      if cf_delete_record(rec["id"], name):
-                          removed += 1
-                          time.sleep(SLEEP_AFTER_DELETE)
-              return removed
+          def push_region(region, nodes):
+              """先清该地区 pt-xx1~pt-xx10，再按序号推新的"""
+              rl = region.lower()
 
-          def cf_push_region(region, nodes):
-              """先删该地区 pt-xx1~pt-xx10，再推送新的（按序号）"""
-              region_lower = region.lower()
-              deleted = cf_clear_region(region_lower)
+              # 1. 清理该地区 10 个确定名字的旧记录
+              deleted = 0
+              for idx in range(1, MAX_PER_REGION + 1):
+                  d = f"{CF_PREFIX}{rl}{idx}.{CF_DOMAIN}"
+                  deleted += cf_delete_by_name(d)
               print(f"  └─ [{region}] 已清理旧记录 {deleted} 条，准备推送 {len(nodes)} 条")
 
+              # 2. 按序号推送
               pushed = 0
               for idx, node in enumerate(nodes, start=1):
-                  sub = f"{CF_PREFIX}{region_lower}{idx}.{CF_DOMAIN}"
-                  if cf_create_record(sub, node["ip"]):
+                  d = f"{CF_PREFIX}{rl}{idx}.{CF_DOMAIN}"
+                  if cf_create(d, node["ip"]):
                       pushed += 1
-                  time.sleep(SLEEP_BETWEEN_API)
               return pushed
 
-          def cf_push_region_with_retry(region, nodes):
-              """推送失败重试一次，仍是先删后推"""
+          def push_region_with_retry(region, nodes):
               try:
-                  pushed = cf_push_region(region, nodes)
+                  pushed = push_region(region, nodes)
                   if pushed == len(nodes):
                       print(f"  ✅ [{region}] 推送完成: {pushed}/{len(nodes)}")
                       return True
@@ -221,7 +208,7 @@ jobs:
 
               try:
                   time.sleep(3)
-                  pushed = cf_push_region(region, nodes)
+                  pushed = push_region(region, nodes)
                   if pushed == len(nodes):
                       print(f"  ✅ [{region}] 重试推送完成: {pushed}/{len(nodes)}")
                       return True
@@ -247,19 +234,17 @@ jobs:
                   print("❌ 所有地区均无有效免费节点，任务终止")
                   sys.exit(1)
 
-              # 1) 写 JSON（按质量排序）
               with open(OUT_JSON, "w", encoding="utf-8") as f:
                   json.dump(buckets, f, ensure_ascii=False, indent=2)
               print(f"✅ 已写入 {OUT_JSON}")
               for r, nodes in buckets.items():
                   print(f"   - {r}: {len(nodes)} 个")
 
-              # 2) 推送 CF（按地区分批，互不影响）
               print("\n🌐 开始推送到 Cloudflare DNS")
               ok_regions, fail_regions = [], []
               for region, nodes in buckets.items():
                   print(f"\n▶️ 处理地区 [{region}] ({len(nodes)} 个)")
-                  if cf_push_region_with_retry(region, nodes):
+                  if push_region_with_retry(region, nodes):
                       ok_regions.append(region)
                   else:
                       fail_regions.append(region)
