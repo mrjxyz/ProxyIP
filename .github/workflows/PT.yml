@@ -41,7 +41,7 @@ jobs:
 
           PROTON_REGIONS = ["US", "CA", "NL", "JP", "SG", "NO", "CH"]
 
-          MAX_PER_REGION = 10
+          MAX_PER_REGION = 5      # ★ 每地区最多提取 / 推送多少个
           CF_PREFIX      = "pt-"
 
           CF_DOMAIN    = os.environ.get("CF_DOMAIN", "").strip().strip(".")
@@ -107,12 +107,9 @@ jobs:
                   buckets[r] = buckets[r][:MAX_PER_REGION]
               return {r: v for r, v in buckets.items() if v}
 
-          # ============ Cloudflare（照抄旧脚本模式） ============
+          # ============ Cloudflare ============
           def cf_delete_by_name(domain):
-              """查询并删除该域名的所有 A 记录（只删这一个域名）"""
-              headers = {
-                  "Authorization": f"Bearer {CF_API_TOKEN}",
-              }
+              headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
               url = (f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}"
                      f"/dns_records?name={domain}&type=A")
               try:
@@ -138,7 +135,6 @@ jobs:
               return deleted
 
           def cf_create(domain, ip):
-              """创建单条 A 记录"""
               headers = {
                   "Authorization": f"Bearer {CF_API_TOKEN}",
                   "Content-Type": "application/json"
@@ -166,7 +162,6 @@ jobs:
                       print(f"    [警告] 创建 {domain} 失败: {data.get('errors')}")
                       return False
               except urllib.error.HTTPError as e:
-                  # 把 CF 返回的 body 打出来，方便定位 400 原因
                   try:
                       err_body = e.read().decode('utf-8')
                   except Exception:
@@ -178,17 +173,14 @@ jobs:
                   return False
 
           def push_region(region, nodes):
-              """先清该地区 pt-xx1~pt-xx10，再按序号推新的"""
               rl = region.lower()
-
-              # 1. 清理该地区 10 个确定名字的旧记录
               deleted = 0
+              # 清理该地区 1..MAX_PER_REGION 的确定名字
               for idx in range(1, MAX_PER_REGION + 1):
                   d = f"{CF_PREFIX}{rl}{idx}.{CF_DOMAIN}"
                   deleted += cf_delete_by_name(d)
               print(f"  └─ [{region}] 已清理旧记录 {deleted} 条，准备推送 {len(nodes)} 条")
 
-              # 2. 按序号推送
               pushed = 0
               for idx, node in enumerate(nodes, start=1):
                   d = f"{CF_PREFIX}{rl}{idx}.{CF_DOMAIN}"
