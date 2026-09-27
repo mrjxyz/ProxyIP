@@ -36,18 +36,6 @@ ProxyIP Top, 早中晚更新, Thanks xgonce!
 
 拉脱维亚 lv.bestcf.eu.cc
 
-
-
-如何使用自己的域名？
-
-Settings -> Secrets and variables -> Actions -> Repository secrets 添加以下3个 Key：
-
-CF_ZONE_ID：点击你的域名 在 Cloudflare 托管面板右侧获得的 Zone ID。
-
-CF_API_TOKEN：具备 Zone.DNS - Edit 权限的 Cloudflare API Token。
-
-CF_DOMAIN：托管在Cloudfalre中的域名，例如bestcf.eu.cc 脚本会自动创建多个地区子域名并更新A记录 例如us.bestcf.eu.cc
-
 --------------------------------------
 
 备用ProxyIP, 每日更新, Thanks CM！
