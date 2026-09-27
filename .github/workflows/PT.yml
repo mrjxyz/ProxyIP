@@ -1,0 +1,274 @@
+name: Proton Logicals -> JSON + CF DNS
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 每小时运行一次
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  process-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Fetch ProtonVPN Logicals, Build JSON, Push CF DNS
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_DOMAIN: ${{ secrets.CF_DOMAIN }}
+        run: |
+          cat << 'EOF' > process_logicals.py
+          # -*- coding: utf-8 -*-
+          import json
+          import os
+          import sys
+          import time
+          import urllib.request
+          import urllib.error
+
+          # ============ 配置 ============
+          SRC_URL   = "https://raw.githubusercontent.com/tn3w/ProtonVPN-IPs/refs/heads/master/protonvpn_logicals.json"
+          OUT_JSON  = "pt-logicals.json"
+
+          # 只处理这些地区（以后在这里扩展即可）
+          PROTON_REGIONS = ["US", "CA", "NL", "JP", "SG", "NO", "CH"]
+
+          MAX_PER_REGION = 10   # 每地区最多提取 / 推送多少个
+          CF_PREFIX      = "pt-"  # 子域名固定前缀
+
+          CF_DOMAIN   = os.environ.get("CF_DOMAIN", "").strip().strip(".")
+          CF_ZONE_ID  = os.environ.get("CF_ZONE_ID", "").strip()
+          CF_API_TOKEN= os.environ.get("CF_API_TOKEN", "").strip()
+
+          # ============ 工具函数 ============
+          def fetch_json(url, timeout=30):
+              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  return json.loads(r.read().decode("utf-8"))
+
+          def pick_ip(server):
+              """取该逻辑节点下第一个在线物理机的 ExitIP"""
+              for s in server.get("Servers", []) or []:
+                  if s.get("Status") == 1 and s.get("ExitIP"):
+                      return s.get("ExitIP")
+              return None
+
+          def is_quality_node(node):
+              """优质免费节点过滤"""
+              if node.get("Tier") != 0:
+                  return False
+              if "FREE" not in (node.get("Name") or "").upper():
+                  return False
+              if node.get("Status") != 1:
+                  return False
+
+              servers = node.get("Servers") or []
+              if not servers:
+                  return False
+              # 所有物理机都要在线且没有服务异常
+              for s in servers:
+                  if s.get("Status") != 1:
+                      return False
+                  if (s.get("ServicesDown") or 0) > 0:
+                      return False
+              return True
+
+          def build_region_nodes(logicals):
+              """按地区白名单构建 {REGION: [node_info, ...]}"""
+              buckets = {r: [] for r in PROTON_REGIONS}
+
+              for node in logicals:
+                  country = (node.get("ExitCountry") or "").upper()
+                  if country not in buckets:
+                      continue
+                  if not is_quality_node(node):
+                      continue
+
+                  ip = pick_ip(node)
+                  if not ip:
+                      continue
+
+                  buckets[country].append({
+                      "domain": node.get("Domain"),
+                      "ip": ip,
+                      "name": node.get("Name"),
+                      "city": node.get("City"),
+                      "load": node.get("Load"),
+                      "score": node.get("Score"),
+                      "tier": node.get("Tier"),
+                      "features": node.get("Features"),
+                  })
+
+              # 排序：Load 升序 -> Score 升序 -> domain 升序
+              for r in buckets:
+                  buckets[r].sort(key=lambda x: (
+                      x["load"] if x["load"] is not None else 9999,
+                      x["score"] if x["score"] is not None else 9999,
+                      x["domain"] or "",
+                  ))
+                  buckets[r] = buckets[r][:MAX_PER_REGION]
+
+              # 去掉空地区
+              return {r: v for r, v in buckets.items() if v}
+
+          # ============ Cloudflare ============
+          def cf_request(url, method="GET", payload=None):
+              headers = {
+                  "Authorization": f"Bearer {CF_API_TOKEN}",
+                  "Content-Type": "application/json",
+              }
+              data = json.dumps(payload).encode("utf-8") if payload is not None else None
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  body = r.read().decode("utf-8")
+                  return json.loads(body) if body else {}
+
+          def cf_list_all_records():
+              """分页拉取该 zone 下所有 DNS 记录"""
+              records = []
+              page = 1
+              while True:
+                  url = (f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}"
+                         f"/dns_records?per_page=100&page={page}")
+                  resp = cf_request(url, "GET")
+                  if not resp.get("success"):
+                      raise RuntimeError(f"CF 列取记录失败: {resp}")
+                  records.extend(resp.get("result", []))
+                  info = resp.get("result_info") or {}
+                  total_pages = info.get("total_pages", 1) or 1
+                  if page >= total_pages:
+                      break
+                  page += 1
+              return records
+
+          def cf_delete_region_records(region_lower):
+              """只删除 pt-{region}* 前缀的 A 记录，绝不误删主域名"""
+              prefix = f"{CF_PREFIX}{region_lower}"
+              all_recs = cf_list_all_records()
+              victims = [
+                  rec for rec in all_recs
+                  if rec.get("type") == "A"
+                  and (rec.get("name") or "").startswith(prefix)
+              ]
+              for rec in victims:
+                  url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{rec['id']}"
+                  try:
+                      cf_request(url, "DELETE")
+                  except Exception as e:
+                      print(f"  [警告] 删除 {rec.get('name')} 失败: {e}")
+              return len(victims)
+
+          def cf_push_region(region, nodes):
+              """先删该地区旧 pt-xx*，再推送新的"""
+              region_lower = region.lower()
+              deleted = cf_delete_region_records(region_lower)
+              print(f"  └─ [{region}] 已删除旧记录 {deleted} 条，准备推送 {len(nodes)} 条")
+
+              create_url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
+              pushed = 0
+              for idx, node in enumerate(nodes, start=1):
+                  sub = f"{CF_PREFIX}{region_lower}{idx}.{CF_DOMAIN}"
+                  payload = {
+                      "type": "A",
+                      "name": sub,
+                      "content": node["ip"],
+                      "ttl": 60,
+                      "proxied": False,
+                  }
+                  try:
+                      resp = cf_request(create_url, "POST", payload)
+                      if resp.get("success"):
+                          pushed += 1
+                      else:
+                          print(f"  [警告] 创建 {sub} 失败: {resp.get('errors')}")
+                  except Exception as e:
+                      print(f"  [警告] 创建 {sub} 异常: {e}")
+              return pushed
+
+          def cf_push_region_with_retry(region, nodes):
+              """推送失败重试一次，仍是先删后推"""
+              try:
+                  pushed = cf_push_region(region, nodes)
+                  if pushed == len(nodes):
+                      print(f"  ✅ [{region}] 推送完成: {pushed}/{len(nodes)}")
+                      return True
+                  print(f"  ⚠️ [{region}] 首次推送不完整 ({pushed}/{len(nodes)})，重试一次")
+              except Exception as e:
+                  print(f"  ⚠️ [{region}] 首次推送异常: {e}，重试一次")
+
+              # 重试
+              try:
+                  time.sleep(2)
+                  pushed = cf_push_region(region, nodes)
+                  if pushed == len(nodes):
+                      print(f"  ✅ [{region}] 重试推送完成: {pushed}/{len(nodes)}")
+                      return True
+                  print(f"  ❌ [{region}] 重试仍不完整 ({pushed}/{len(nodes)})，放弃该地区")
+                  return False
+              except Exception as e:
+                  print(f"  ❌ [{region}] 重试异常: {e}，放弃该地区")
+                  return False
+
+          # ============ 主流程 ============
+          def main():
+              if not (CF_ZONE_ID and CF_API_TOKEN and CF_DOMAIN):
+                  print("❌ 缺少 CF_ZONE_ID / CF_API_TOKEN / CF_DOMAIN")
+                  sys.exit(1)
+
+              print(f"⬇️ 拉取源 JSON: {SRC_URL}")
+              data = fetch_json(SRC_URL)
+              logicals = data.get("LogicalServers") or []
+              print(f"   共 {len(logicals)} 个逻辑节点")
+
+              buckets = build_region_nodes(logicals)
+              if not buckets:
+                  print("❌ 所有地区均无有效免费节点，任务终止")
+                  sys.exit(1)
+
+              # 1) 写 JSON（按质量排序）
+              with open(OUT_JSON, "w", encoding="utf-8") as f:
+                  json.dump(buckets, f, ensure_ascii=False, indent=2)
+              print(f"✅ 已写入 {OUT_JSON}")
+              for r, nodes in buckets.items():
+                  print(f"   - {r}: {len(nodes)} 个")
+
+              # 2) 推送 CF（按地区分批，互不影响）
+              print("\n🌐 开始推送到 Cloudflare DNS")
+              ok_regions, fail_regions = [], []
+              for region, nodes in buckets.items():
+                  print(f"\n▶️ 处理地区 [{region}] ({len(nodes)} 个)")
+                  if cf_push_region_with_retry(region, nodes):
+                      ok_regions.append(region)
+                  else:
+                      fail_regions.append(region)
+
+              print("\n========== 汇总 ==========")
+              print(f"成功: {ok_regions}")
+              print(f"失败: {fail_regions}")
+
+              # 只要有一个地区成功，就不算整体失败
+              if not ok_regions:
+                  print("❌ 所有地区推送均失败")
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          python process_logicals.py
+
+      - name: Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]"
+          git add pt-logicals.json
+          git diff --staged --quiet || (git commit -m "Update pt-logicals.json [skip ci]" && git push)
