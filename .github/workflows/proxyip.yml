@@ -380,7 +380,7 @@ jobs:
 
                   # 3. 推送 Cloudflare DNS (固定 Top10)
                   if domain:
-                      push_to_cloudflare(domain, ip_list, max_push=10)
+                      push_to_cloudflare(domain, ip_list, max_push=5)
                   else:
                       print(f"[提示] 未配置 BASE_DOMAIN，跳过域名 [{prefix}] 的 Cloudflare 推送")
 
