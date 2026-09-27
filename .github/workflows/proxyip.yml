@@ -279,7 +279,7 @@ jobs:
               matched.sort(key=lambda x: (-x["speed"], x["tls_delay"]))
               return matched
 
-          def push_to_cloudflare(domain, ip_list, max_push=10):
+          def push_to_cloudflare(domain, ip_list, max_push=5):
               """清理现有域名 A 记录并写入最新的前 N 个高带宽 IP"""
               zone_id = os.environ.get("CF_ZONE_ID")
               api_token = os.environ.get("CF_API_TOKEN")
